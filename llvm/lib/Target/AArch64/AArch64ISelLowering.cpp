@@ -3565,6 +3565,9 @@ void AArch64TargetLowering::fixupPtrauthDiscriminator(
     AddrDisc = TmpReg;
   }
 
+  if (AddrDiscOp.getReg() != AddrDisc)
+    AddrDiscOp.setIsKill(false);
+
   AddrDiscOp.setReg(AddrDisc);
   IntDiscOp.setImm(IntDisc);
 }
@@ -12186,32 +12189,98 @@ SDValue AArch64TargetLowering::LowerBitreverse(SDValue Op,
                      DAG.getNode(ISD::BITREVERSE, DL, VST, REVB));
 }
 
+// A CCMP folds in only a 5-bit unsigned immediate (or its negation, via CCMN);
+// any other constant must be materialized into a register first.
+static bool isLegalCondCmpImmediate(const APInt &Imm) {
+  return Imm.sgt(-32) && Imm.slt(32);
+}
+
+// True unless one of the operands is a constant that cannot be encoded as a
+// CMP/CMN immediate. A non-constant operand always lives in a register, so it
+// is fine.
+static bool hasLegalCmpImmediate(SDValue LHS, SDValue RHS) {
+  ConstantSDNode *C = dyn_cast<ConstantSDNode>(LHS);
+  if (C && !llvm::AArch64_AM::isLegalCmpImmed(C->getAPIntValue()))
+    return false;
+  C = dyn_cast<ConstantSDNode>(RHS);
+  if (C && !llvm::AArch64_AM::isLegalCmpImmed(C->getAPIntValue()))
+    return false;
+  return true;
+}
+
+// As hasLegalCmpImmediate, but for the tighter CCMP immediate form.
+static bool hasLegalCondCmpImmediate(SDValue LHS, SDValue RHS) {
+  ConstantSDNode *C = dyn_cast<ConstantSDNode>(LHS);
+  if (C && !isLegalCondCmpImmediate(C->getAPIntValue()))
+    return false;
+  C = dyn_cast<ConstantSDNode>(RHS);
+  if (C && !isLegalCondCmpImmediate(C->getAPIntValue()))
+    return false;
+  return true;
+}
+
+// True if either operand is a constant that does not fit a CCMP immediate but
+// is a legal logical immediate: folding it into the xor is a single cheap
+// instruction, yet the result still needs a scratch register for the CCMP.
+// Chaining more than two such compares costs more than the CCMP form saves.
+static bool hasCheapXorImmediateThatNeedsCondCmpReg(
+    const std::pair<SDValue, SDValue> &Pair) {
+  for (SDValue V : {Pair.first, Pair.second}) {
+    auto *C = dyn_cast<ConstantSDNode>(V);
+    if (!C || isLegalCondCmpImmediate(C->getAPIntValue()))
+      continue;
+    const APInt &Imm = C->getAPIntValue();
+    unsigned BitWidth = Imm.getBitWidth() <= 32 ? 32 : 64;
+    if (Imm.getBitWidth() <= BitWidth &&
+        AArch64_AM::isLogicalImmediate(Imm.getZExtValue(), BitWidth))
+      return true;
+  }
+  return false;
+}
+
 // Check whether the continuous comparison sequence.
 static bool
-isOrXorChain(SDValue N, unsigned &Num,
-             SmallVector<std::pair<SDValue, SDValue>, 16> &WorkList) {
-  if (Num == MaxXors)
+isOrXorChain(SDValue N, SelectionDAG &DAG, unsigned &NumLeaves,
+             unsigned &NumXors, bool &SawXor, bool RequireLegalCmpImmediates,
+             SmallVectorImpl<std::pair<SDValue, SDValue>> &WorkList) {
+  if (NumLeaves == MaxXors)
     return false;
 
   // Skip the one-use zext
   if (N->getOpcode() == ISD::ZERO_EXTEND && N->hasOneUse())
     N = N->getOperand(0);
 
-  // The leaf node must be XOR
   if (N->getOpcode() == ISD::XOR) {
+    if (RequireLegalCmpImmediates &&
+        !hasLegalCmpImmediate(N->getOperand(0), N->getOperand(1)))
+      return false;
     WorkList.push_back(std::make_pair(N->getOperand(0), N->getOperand(1)));
-    Num++;
+    NumLeaves++;
+    NumXors++;
+    SawXor = true;
     return true;
   }
 
   // All the non-leaf nodes must be OR.
-  if (N->getOpcode() != ISD::OR || !N->hasOneUse())
+  if (N->getOpcode() == ISD::OR && N->hasOneUse())
+    return isOrXorChain(N->getOperand(0), DAG, NumLeaves, NumXors, SawXor,
+                        RequireLegalCmpImmediates, WorkList) &&
+           isOrXorChain(N->getOperand(1), DAG, NumLeaves, NumXors, SawXor,
+                        RequireLegalCmpImmediates, WorkList);
+  if (N->getOpcode() == ISD::OR)
     return false;
 
-  if (isOrXorChain(N->getOperand(0), Num, WorkList) &&
-      isOrXorChain(N->getOperand(1), Num, WorkList))
-    return true;
-  return false;
+  EVT VT = N.getValueType();
+  if (!VT.isScalarInteger())
+    return false;
+
+  // A xor with zero may have been folded away before this combine sees it.
+  // Treat such leaves as comparisons with zero so the original OR/XOR form and
+  // type-legalized wide integer equality compares converge to the same SETCC
+  // tree.
+  WorkList.push_back(std::make_pair(N, DAG.getConstant(0, SDLoc(N), VT)));
+  NumLeaves++;
+  return true;
 }
 
 // Transform chains of ORs and XORs, which usually outlined by memcmp/bmp.
@@ -12229,10 +12298,50 @@ static SDValue performOrXorChainCombine(SDNode *N, SelectionDAG &DAG) {
   ISD::CondCode Cond = cast<CondCodeSDNode>(N->getOperand(2))->get();
   // Try to express conjunction "cmp 0 (or (xor A0 A1) (xor B0 B1))" as:
   // sub A0, A1; ccmp B0, B1, 0, eq; cmp inv(Cond) flag
+  unsigned NumLeaves = 0;
   unsigned NumXors = 0;
+  bool SawXor = false;
+  bool RequireLegalCmpImmediates = any_of(N->users(), [](SDNode *User) {
+    return User->getOpcode() == ISD::BRCOND ||
+           User->getOpcode() == AArch64ISD::BRCOND;
+  });
   if ((Cond == ISD::SETEQ || Cond == ISD::SETNE) && isNullConstant(RHS) &&
       LHS->getOpcode() == ISD::OR && LHS->hasOneUse() &&
-      isOrXorChain(LHS, NumXors, WorkList)) {
+      isOrXorChain(LHS, DAG, NumLeaves, NumXors, SawXor,
+                   RequireLegalCmpImmediates, WorkList) &&
+      SawXor) {
+    // A CCMP sequence serializes the comparisons through NZCV. Keep the
+    // default transform to short chains, but account for real XOR leaves: each
+    // one removed is a code-size and front-end win. Under size optimization,
+    // prefer the smaller CCMP form unless another guard rejects it.
+    const Function &F = DAG.getMachineFunction().getFunction();
+    unsigned Limit = 5;
+    if (NumXors >= 6) {
+      Limit = 6;
+      if (NumXors == NumLeaves)
+        Limit = std::min<unsigned>(8, NumXors);
+    }
+    if (F.hasMinSize())
+      Limit = MaxXors;
+    if (WorkList.size() > Limit)
+      return SDValue();
+
+    if (WorkList.size() > 2 &&
+        any_of(WorkList, hasCheapXorImmediateThatNeedsCondCmpReg))
+      return SDValue();
+
+    // Only the leading compare of the chain uses the wider CMP immediate; the
+    // rest become CCMPs. So a compare whose immediate is a legal CMP operand
+    // but not a legal CCMP operand is cheapest at the front.
+    auto PreferAsFirstCmp = [](const std::pair<SDValue, SDValue> &Pair) {
+      return hasLegalCmpImmediate(Pair.first, Pair.second) &&
+             !hasLegalCondCmpImmediate(Pair.first, Pair.second);
+    };
+    SmallVector<std::pair<SDValue, SDValue>, 16>::iterator First =
+        find_if(WorkList, PreferAsFirstCmp);
+    if (First != WorkList.end())
+      std::iter_swap(WorkList.begin(), First);
+
     SDValue XOR0, XOR1;
     std::tie(XOR0, XOR1) = WorkList[0];
     unsigned LogicOp = (Cond == ISD::SETEQ) ? ISD::AND : ISD::OR;
@@ -14282,6 +14391,10 @@ SDValue AArch64TargetLowering::ReconstructShuffle(SDValue Op,
     bool operator ==(SDValue OtherVec) { return Vec == OtherVec; }
   };
 
+  auto IsNeonSized = [](EVT VT) {
+    return VT.is128BitVector() || VT.is64BitVector();
+  };
+
   // First gather all vectors used as an immediate source for this BUILD_VECTOR
   // node.
   SmallVector<ShuffleSourceInfo, 2> Sources;
@@ -14291,11 +14404,11 @@ SDValue AArch64TargetLowering::ReconstructShuffle(SDValue Op,
       continue;
     else if (V.getOpcode() != ISD::EXTRACT_VECTOR_ELT ||
              !isa<ConstantSDNode>(V.getOperand(1)) ||
-             V.getOperand(0).getValueType().isScalableVector()) {
+             !IsNeonSized(V->getOperand(0).getValueType())) {
       LLVM_DEBUG(
           dbgs() << "Reshuffle failed: "
                     "a shuffle can only come from building a vector from "
-                    "various elements of other fixed-width vectors, provided "
+                    "various elements of other NEON-sized vectors, provided "
                     "their indices are constant\n");
       return SDValue();
     }
@@ -21971,6 +22084,62 @@ performExtractLastActiveCombine(SDNode *N, TargetLowering::DAGCombinerInfo &DCI,
                      Vec);
 }
 
+static bool hasSVEMultiVectorOps(const AArch64Subtarget *Subtarget) {
+  return (Subtarget->isSVEorStreamingSVEAvailable() &&
+          Subtarget->hasSVE2p1()) ||
+         (Subtarget->isStreaming() && Subtarget->hasSME2());
+}
+
+static auto m_PredicateAsCounterWhile() {
+  using namespace llvm::SDPatternMatch;
+  return m_AnyOf(m_SpecificOpc(AArch64ISD::WHILEGE_PRED_COUNTER),
+                 m_SpecificOpc(AArch64ISD::WHILEGT_PRED_COUNTER),
+                 m_SpecificOpc(AArch64ISD::WHILELT_PRED_COUNTER),
+                 m_SpecificOpc(AArch64ISD::WHILELE_PRED_COUNTER),
+                 m_SpecificOpc(AArch64ISD::WHILEHS_PRED_COUNTER),
+                 m_SpecificOpc(AArch64ISD::WHILEHI_PRED_COUNTER),
+                 m_SpecificOpc(AArch64ISD::WHILELO_PRED_COUNTER),
+                 m_SpecificOpc(AArch64ISD::WHILELS_PRED_COUNTER));
+}
+
+/// Folds extracting the first lane from the first segment of a
+/// predicate-as-counter while to a conditional set (CSET) based on the
+/// "FIRST_ACTIVE" status flag from the while.
+///
+///   %while, %flags = WHILE_*_PRED_COUNTER .. ; predicate-as-counter while
+///   %first.segment = pext(%while, 0) ; predicate extract of segment 0
+///   %first.active = extract_elt(%first.segment, 0) ; extract first lane
+///
+///   ->
+///
+///   %while, %flags = WHILE_*_PRED_COUNTER .. ; predicate-as-counter while
+///   %first.active = cset(%flags, FIRST_ACTIVE)
+static SDValue
+perfomPextFirstTrueVectorCombine(SDNode *N,
+                                 TargetLowering::DAGCombinerInfo &DCI,
+                                 const AArch64Subtarget *Subtarget) {
+  using namespace llvm::SDPatternMatch;
+  assert(N->getOpcode() == ISD::EXTRACT_VECTOR_ELT);
+  if (DCI.isBeforeLegalize() || !hasSVEMultiVectorOps(Subtarget))
+    return SDValue();
+
+  SDValue N0 = N->getOperand(0);
+  EVT VT = N0.getValueType();
+
+  if (!VT.isScalableVectorOf(MVT::i1) || !isNullConstant(N->getOperand(1)))
+    return SDValue();
+
+  if (!sd_match(N0, m_IntrinsicWOChain<Intrinsic::aarch64_sve_pext>(
+                        m_PredicateAsCounterWhile(), m_Zero())))
+    return SDValue();
+
+  // Fold: extract_elt(pext(WHILE_*_PRED_COUNTER:0, 0), 0)
+  // to cset(WHILE_*_PRED_COUNTER:1, FIRST_ACTIVE).
+  SDValue WhilePredCounter = N0->getOperand(1);
+  SDValue Flags = SDValue(WhilePredCounter.getNode(), 1);
+  return getSETCC(AArch64CC::CondCode::FIRST_ACTIVE, Flags, SDLoc(N), DCI.DAG);
+}
+
 static SDValue
 performExtractVectorEltCombine(SDNode *N, TargetLowering::DAGCombinerInfo &DCI,
                                const AArch64Subtarget *Subtarget) {
@@ -21980,6 +22149,8 @@ performExtractVectorEltCombine(SDNode *N, TargetLowering::DAGCombinerInfo &DCI,
   if (SDValue Res = performLastTrueTestVectorCombine(N, DCI, Subtarget))
     return Res;
   if (SDValue Res = performExtractLastActiveCombine(N, DCI, Subtarget))
+    return Res;
+  if (SDValue Res = perfomPextFirstTrueVectorCombine(N, DCI, Subtarget))
     return Res;
 
   SelectionDAG &DAG = DCI.DAG;
@@ -23001,6 +23172,25 @@ static SDValue foldADCToCINC(SDNode *N, SelectionDAG &DAG) {
   // (CINC x cc cond) <=> (CSINC x x !cc cond)
   SDValue CC = getCondCode(DAG, AArch64CC::LO);
   return DAG.getNode(AArch64ISD::CSINC, DL, VT, LHS, LHS, CC, Cond);
+}
+
+/// Takes advantage of the negation of the second operand by the with-carry-in
+/// instructions to fold:
+///
+///   AddWithCarry(X, -1, C) => SubWithCarry(X, 0, C)
+///   SubWithCarry(X, -1, C) => AddWithCarry(X, 0, C)
+///
+/// This allows using the zero register (xzr/wzr) to encode the immediate
+/// operand (rather than a MOV to a GPR).
+static SDValue performAddSubCarryCombine(SDNode *N, SelectionDAG &DAG,
+                                         unsigned NewOpcode) {
+  if (isAllOnesConstant(N->getOperand(1))) {
+    SDLoc DL(N);
+    SDValue RHS = DAG.getConstant(0, DL, N->getValueType(0));
+    return DAG.getNode(NewOpcode, DL, N->getVTList(), N->getOperand(0), RHS,
+                       N->getOperand(2));
+  }
+  return SDValue();
 }
 
 static SDValue performBuildVectorCombine(SDNode *N,
@@ -25384,6 +25574,16 @@ static SDValue performExtendCombine(SDNode *N,
   if (SDValue R = performExtendDuplaneTruncCombine(N, DAG))
     return R;
 
+  // Fold an extend of a CSET into its arms:
+  //   ?ext (CSEL 0/1, 1/0, cc, cond) -> CSEL (zext 0/1), (zext 1/0), cc, cond
+  // This is not done for zero-extend since (i64 zext (i32 CSET)) is free.
+  if (N->getOpcode() != ISD::ZERO_EXTEND && VT == MVT::i64 && N0.hasOneUse() &&
+      getCSETCondCode(N0))
+    return DAG.getNode(AArch64ISD::CSEL, dl, VT,
+                       DAG.getNode(ISD::ZERO_EXTEND, dl, VT, N0.getOperand(0)),
+                       DAG.getNode(ISD::ZERO_EXTEND, dl, VT, N0.getOperand(1)),
+                       N0.getOperand(2), N0.getOperand(3));
+
   return SDValue();
 }
 
@@ -25939,6 +26139,12 @@ static SDValue performUzpCombine(SDNode *N, SelectionDAG &DAG,
   SDValue Op0 = N->getOperand(0);
   SDValue Op1 = N->getOperand(1);
   EVT ResVT = N->getValueType(0);
+
+  // UZP is used to lower insert_subvector quite early. When later DAG combines
+  // run, it's possible to actually end up with an insert of UNDEF into UNDEF,
+  // i.e. UZP1 UNDEF, UNDEF.
+  if (Op0.isUndef() && Op1.isUndef())
+    return DAG.getUNDEF(ResVT);
 
   // uzp(extract_lo(x), extract_hi(x)) -> extract_lo(uzp x, x)
   if (Op0.getOpcode() == ISD::EXTRACT_SUBVECTOR &&
@@ -29171,11 +29377,17 @@ static SDValue performDUPCombine(SDNode *N,
 
 /// Get rid of unnecessary NVCASTs (that don't change the type).
 static SDValue performNVCASTCombine(SDNode *N, SelectionDAG &DAG) {
-  if (N->getValueType(0) == N->getOperand(0).getValueType())
-    return N->getOperand(0);
-  if (N->getOperand(0).getOpcode() == AArch64ISD::NVCAST)
-    return DAG.getNode(AArch64ISD::NVCAST, SDLoc(N), N->getValueType(0),
-                       N->getOperand(0).getOperand(0));
+  EVT VT = N->getValueType(0);
+  SDValue Op = N->getOperand(0);
+
+  if (VT == Op.getValueType())
+    return Op;
+
+  if (Op.isUndef())
+    return DAG.getUNDEF(VT);
+
+  if (Op.getOpcode() == AArch64ISD::NVCAST)
+    return DAG.getNode(AArch64ISD::NVCAST, SDLoc(N), VT, Op.getOperand(0));
 
   return SDValue();
 }
@@ -30417,17 +30629,25 @@ SDValue AArch64TargetLowering::PerformDAGCombine(SDNode *N,
   case AArch64ISD::ADC:
     if (auto R = foldOverflowCheck(N, DAG, /* IsAdd */ true))
       return R;
+    if (auto R = performAddSubCarryCombine(N, DAG, AArch64ISD::SBC))
+      return R;
     return foldADCToCINC(N, DAG);
   case AArch64ISD::SBC:
-    return foldOverflowCheck(N, DAG, /* IsAdd */ false);
+    if (auto R = foldOverflowCheck(N, DAG, /* IsAdd */ false))
+      return R;
+    return performAddSubCarryCombine(N, DAG, AArch64ISD::ADC);
   case AArch64ISD::ADCS:
     if (auto R = foldOverflowCheck(N, DAG, /* IsAdd */ true))
       return R;
-    return performFlagSettingCombine(N, DCI, AArch64ISD::ADC);
+    if (auto R = performFlagSettingCombine(N, DCI, AArch64ISD::ADC))
+      return R;
+    return performAddSubCarryCombine(N, DAG, AArch64ISD::SBCS);
   case AArch64ISD::SBCS:
     if (auto R = foldOverflowCheck(N, DAG, /* IsAdd */ false))
       return R;
-    return performFlagSettingCombine(N, DCI, AArch64ISD::SBC);
+    if (auto R = performFlagSettingCombine(N, DCI, AArch64ISD::SBC))
+      return R;
+    return performAddSubCarryCombine(N, DAG, AArch64ISD::ADCS);
   case AArch64ISD::ADDS:
     return performFlagSettingCombine(N, DCI, ISD::ADD);
   case AArch64ISD::SUBS:
@@ -32041,8 +32261,9 @@ Value *AArch64TargetLowering::emitLoadLinked(IRBuilderBase &Builder,
     Value *LoHi =
         Builder.CreateIntrinsic(Int, Addr, /*FMFSource=*/nullptr, "lohi");
 
-    Value *Lo = Builder.CreateExtractValue(LoHi, 0, "lo");
-    Value *Hi = Builder.CreateExtractValue(LoHi, 1, "hi");
+    unsigned LoPos = Subtarget->isLittleEndian() ? 0 : 1;
+    Value *Lo = Builder.CreateExtractValue(LoHi, LoPos, "lo");
+    Value *Hi = Builder.CreateExtractValue(LoHi, 1 - LoPos, "hi");
 
     auto *Int128Ty = Type::getInt128Ty(Builder.getContext());
     Lo = Builder.CreateZExt(Lo, Int128Ty, "lo64");
@@ -32093,7 +32314,10 @@ Value *AArch64TargetLowering::emitStoreConditional(IRBuilderBase &Builder,
     Value *Lo = Builder.CreateTrunc(CastVal, Int64Ty, "lo");
     Value *Hi =
         Builder.CreateTrunc(Builder.CreateLShr(CastVal, 64), Int64Ty, "hi");
-    return Builder.CreateCall(Stxr, {Lo, Hi, Addr});
+    if (Subtarget->isLittleEndian())
+      return Builder.CreateCall(Stxr, {Lo, Hi, Addr});
+    else
+      return Builder.CreateCall(Stxr, {Hi, Lo, Addr});
   }
 
   Intrinsic::ID Int =
