@@ -102,6 +102,12 @@ public:
     Value posLo = MULI(p, lvlSize);
     return {posLo, lvlSize};
   }
+
+  ValuePair collapseRangeBetween(OpBuilder &b, Location l, ValueRange,
+                                 ValuePair parentRange) const override {
+    return {MULI(parentRange.first, lvlSize),
+            MULI(parentRange.second, lvlSize)};
+  }
 };
 
 class BatchLevel : public SparseTensorLevel {
@@ -167,6 +173,17 @@ public:
     b.setInsertionPointAfter(posRangeIf);
     ValueRange posRange = posRangeIf.getResults();
     return {posRange.front(), posRange.back()};
+  }
+
+  ValuePair collapseRangeBetween(OpBuilder &b, Location l,
+                                 ValueRange batchPrefix,
+                                 ValuePair parentRange) const override {
+    SmallVector<Value> memCrd(batchPrefix);
+    memCrd.push_back(parentRange.first);
+    Value pLo = genIndexLoad(b, l, getPosBuf(), memCrd);
+    memCrd.back() = parentRange.second;
+    Value pHi = genIndexLoad(b, l, getPosBuf(), memCrd);
+    return {pLo, pHi};
   }
 }; // namespace
 

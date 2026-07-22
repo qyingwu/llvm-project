@@ -65,3 +65,16 @@ func.func @sparse_iteration_dense_level(%sp: tensor<?x?xf64, #DenseCompressed>) 
   }
   return
 }
+
+// CHECK-LABEL:   @sparse_iteration_dense_compressed_space
+// CHECK:           sparse_tensor.positions
+// CHECK:           memref.load
+// CHECK:           scf.for
+func.func @sparse_iteration_dense_compressed_space(%sp: tensor<?x?xf64, #DenseCompressed>) {
+  %0 = sparse_tensor.extract_iteration_space %sp lvls = 0 to 2
+      : tensor<?x?xf64, #DenseCompressed> -> !sparse_tensor.iter_space<#DenseCompressed, lvls = 0 to 2>
+  sparse_tensor.iterate %it in %0 at(%i, %j)
+      : !sparse_tensor.iter_space<#DenseCompressed, lvls = 0 to 2> {
+  }
+  return
+}
